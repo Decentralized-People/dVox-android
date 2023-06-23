@@ -38,8 +38,10 @@ import com.muddzdev.styleabletoast.StyleableToast;
 import org.json.JSONException;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
-
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 
 public class HomeFragment extends Fragment {
@@ -67,7 +69,7 @@ public class HomeFragment extends Fragment {
 
     private int realEndID = 0;
 
-    private int numberOfPostsToLoad = 15;
+    private int numberOfPostsToLoad = 8;
 
     private boolean refreshEnabled = false;
 
@@ -182,12 +184,21 @@ public class HomeFragment extends Fragment {
         super.onResume();
     }
 
+    private void queryPosts(int numberOfPosts, int currentId) {
+
+        //queryPostsSeq(numberOfPosts, currentId);
+        int parallelism = ForkJoinPool.commonPool().getActiveThreadCount();
+        System.out.println("Number of threads (before): " + parallelism);
+        queryPostsPar(numberOfPosts, currentId);
+
+    }
+
     /**
      * Retrieves the certain number of last posts from the smart contract.
      *
      * @param numberOfPosts - the number of posts to get
      */
-    private void queryPosts(int numberOfPosts, int currentId) {
+    private void queryPostsSeq(int numberOfPosts, int currentId) {
 
         Thread thread = new Thread(new Runnable() {
             @Override
@@ -218,8 +229,12 @@ public class HomeFragment extends Fragment {
                 Log.d("Post loader", "Trying to print... in total:" + postCount);
 
                 if ( postCount > 0){
+                    long startTime = System.currentTimeMillis();
                     for (int i = postCount; i > postCount - numberOfPosts; i--){
                         if (i > 0) {
+                            int parallelism = ForkJoinPool.commonPool().getActiveThreadCount();
+                            String threadName = Thread.currentThread().getName();
+                            System.out.println("Number of threads: " + parallelism + ". Thread name: " + threadName + ", Number: " + i);
                             Post post = contract.getPost(i);
 
                             if (!post.isBan()) {
@@ -241,7 +256,119 @@ public class HomeFragment extends Fragment {
                         realEndID = allPosts.size();
                         loadMore = true;
                     }
+
+                    long endTime = System.currentTimeMillis();
+                    long duration = endTime - startTime;
+                    System.out.println("Execution time (seq): " + duration  + " milliseconds");
                 };
+
+                // ################# GET ALL POSTS #################//
+
+                if (getActivity() != null) {
+                    getActivity().runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+
+                            if (shimmerNeedstoBeDeleted) {
+                                adapter.notifyItemRemoved(0);
+                                adapter.notifyItemRangeInserted(positionStart-1, itemCount);
+                                shimmerNeedstoBeDeleted = false;
+                            }
+                            else
+                                adapter.notifyItemRangeInserted(positionStart, itemCount);
+                            refreshEnabled = true;
+
+                        }
+                    });
+                }
+            }
+        });
+
+        refreshEnabled = false;
+        loadMore = false;
+        itemCount = 0;
+        positionStart = allPosts.size();
+        thread.start();
+    }
+
+    private void queryPostsPar(int numberOfPosts, int currentId) {
+
+        Thread thread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                // ################# GET ALL POSTS #################//
+                SharedPreferences preferences = getActivity().getSharedPreferences("pref", Context.MODE_PRIVATE);
+
+                while (preferences.getString("credentials", "error").equals("error") ||
+                        preferences.getString("contractAddress", "error").equals("error") ||
+                        preferences.getString("credentials", "error").equals("error")) {
+                    try {
+                        Thread.sleep(250);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
+
+                SmartContract contract = new SmartContract(preferences);
+
+                int postCount;
+                int contractPosts = contract.getPostCount();
+
+                if (currentId == -1)
+                    postCount = contractPosts;
+                else
+                    postCount = contractPosts - currentId;
+
+                Log.d("Post loader", "Trying to print... in total:" + postCount);
+
+                if ( postCount > 0){
+
+                    List<Integer> range = new ArrayList<>();
+                    for (int i = postCount; i > postCount - numberOfPosts; i--) {
+                        range.add(i);
+                    }
+
+                    AtomicBoolean thereIsShimmerFinal = new AtomicBoolean(thereIsShimmer);
+                    Collections.reverse(range);
+
+                    long startTime = System.currentTimeMillis();
+                    range.parallelStream().forEach(i -> {
+                        int parallelism = ForkJoinPool.commonPool().getActiveThreadCount();
+                        String threadName = Thread.currentThread().getName();
+                        System.out.println("Number of threads: " + parallelism + ". Thread name: " + threadName + ", Number: " + i);
+
+                        if (i > 0) {
+                            Post post = contract.getPost(i);
+
+                            if (!post.isBan()) {
+                                if (thereIsShimmerFinal.get()) {
+
+                                    synchronized (allPosts) {
+                                        if (!allPosts.isEmpty()) {
+                                            allPosts.remove(0);
+                                        }
+                                    }
+                                    postViewModel.insert(post);
+                                    thereIsShimmerFinal.set(false);
+                                }
+                                allPosts.add(post);
+                                itemCount++;
+                                //postViewModel.insert(post);
+                            }
+
+                            if (post.getId() == 1)
+                                lastPost = true;
+
+                        }
+
+                        realEndID = allPosts.size();
+                        loadMore = true;
+                    });
+                    long endTime = System.currentTimeMillis();
+                    long duration = endTime - startTime;
+                    System.out.println("Execution time (par): " + duration + " milliseconds");
+
+                }
 
                 // ################# GET ALL POSTS #################//
 
